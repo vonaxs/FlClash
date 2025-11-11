@@ -1,17 +1,17 @@
-name: build-android
+name: build
 
 on:
-  workflow_dispatch:           # ✅ 支持手动触发
+  workflow_dispatch: {}
   push:
     tags:
-      - 'v*'                   # ✅ 推送 tag 时也能自动触发
+      - 'v*'
 
 env:
   IS_STABLE: ${{ !contains(github.ref, '-') }}
 
 jobs:
   build:
-    runs-on: ubuntu-latest     # ✅ 固定为 ubuntu（只构建安卓）
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
@@ -24,14 +24,55 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Android Signing
+      - name: Setup Android Signing (keystore + google-services.json)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p android/app
-          echo "${{ secrets.KEYSTORE }}" | base64 --decode > android/app/keystore.jks
-          echo "${{ secrets.SERVICE_JSON }}" | base64 --decode > android/app/google-services.json
-          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> android/local.properties
-          echo "storePassword=${{ secrets.STORE_PASSWORD }}" >> android/local.properties
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> android/local.properties
+
+          # 1) keystore: 如果传了 SECRET（base64），解码；否则生成临时 keystore（debug-like）
+          if [ -n "${{ secrets.KEYSTORE || '' }}" ]; then
+            echo "${{ secrets.KEYSTORE }}" | base64 --decode > android/app/keystore.jks
+            echo "[info] keystore decoded from secrets"
+          else
+            echo "[warn] KEYSTORE secret not found — generating temporary keystore at android/app/keystore.jks"
+            keytool -genkeypair \
+              -alias flclash \
+              -keyalg RSA -keysize 2048 \
+              -validity 10000 \
+              -keystore android/app/keystore.jks \
+              -storepass android \
+              -keypass android \
+              -dname "CN=FlClash, OU=Dev, O=FlClash, L=City, ST=State, C=CN"
+            # 设置默认 secret 值以便 local.properties 写入（便于构建脚本读取）
+            echo "Using generated keystore (alias=flclash, storepass=android, keypass=android)"
+            echo "KEY_ALIAS=flclash" >> $GITHUB_ENV
+            echo "STORE_PASSWORD=android" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=android" >> $GITHUB_ENV
+          fi
+
+          # 2) google-services.json: 如果提供则解码；否则创建空文件（原作者做法：留空文件也能走 setup.dart）
+          if [ -n "${{ secrets.SERVICE_JSON || '' }}" ]; then
+            echo "${{ secrets.SERVICE_JSON }}" | base64 --decode > android/app/google-services.json
+            echo "[info] google-services.json decoded from secrets"
+          else
+            # create empty file so gradle tasks that check presence won't fail in certain wrappers;
+            # setup.dart / flutter_distributor 通常会绕过严格 Firebase 检查
+            touch android/app/google-services.json
+            echo "[warn] SERVICE_JSON secret not found — created empty android/app/google-services.json"
+          fi
+
+          # 3) 写入 android/local.properties 中的签名信息（setup.dart / gradle 有时会读取）
+          mkdir -p android
+          # 优先使用 secrets 中的值（有的话），否则使用在上面生成的默认值（GITHUB_ENV）
+          KEY_ALIAS="${{ secrets.KEY_ALIAS || env.KEY_ALIAS || 'flclash' }}"
+          STORE_PASSWORD="${{ secrets.STORE_PASSWORD || env.STORE_PASSWORD || 'android' }}"
+          KEY_PASSWORD="${{ secrets.KEY_PASSWORD || env.KEY_PASSWORD || 'android' }}"
+
+          # 写 local.properties（追加）
+          echo "keyAlias=${KEY_ALIAS}" >> android/local.properties
+          echo "storePassword=${STORE_PASSWORD}" >> android/local.properties
+          echo "keyPassword=${KEY_PASSWORD}" >> android/local.properties
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -45,20 +86,21 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Get Flutter Dependency
+      - name: Get Flutter dependency
         run: flutter pub get
 
-      - name: Build FlClash Android
+      - name: Build FlClash Android (use author's setup.dart)
+        env:
+          # 把 IS_STABLE 传给 setup.dart（作者脚本会用）
+          IS_STABLE: ${{ env.IS_STABLE }}
         run: |
-          dart setup.dart android --env stable || \
-          flutter build apk --release --split-per-abi --no-shrink
-          echo "✅ Android 构建完成"
+          set -euo pipefail
+          # 使用作者的包装脚本（不要直接 flutter build apk）
+          dart setup.dart android --env stable
 
-      - name: Upload APK
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: artifact-android
-          path: |
-            ./dist/
-            build/app/outputs/flutter-apk/*.apk
+          name: flclash-android
+          path: ./dist
           overwrite: true
